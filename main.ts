@@ -25,7 +25,8 @@
 //
 // All indicators run in float64 on + - * / alone over the closes seen so
 // far, so two runs over the same bars send byte-identical orders. No
-// clock, no environment, no randomness is ever read. Edition of 17 Nov 2026.
+// clock, no environment, no randomness is ever read. Race edition of
+// 17 November 2026, adapted from the 15 Nov Sakura BTC Racer.
 
 import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
@@ -61,7 +62,7 @@ const B_COOLDOWN = 60;
 
 const EMA_SPAN = 120;
 const RSI_SPAN = 14;
-const WARMUP_BARS = 130; // indicators are trusted from this bar on
+const WARMUP_BARS = 130; // indicators are trusted from this bar on (EMA/RSI settled)
 
 // --- indicator state -----------------------------------------------------
 const closes: number[] = [];
@@ -177,6 +178,8 @@ function entryOrders(state: BarsState): (BuyInput | SellInput)[] {
   return [];
 }
 
+// Exits are evaluated only while a position is open: take-profit,
+// stop-loss, the trailing stop under the peak close, or the hold cap.
 function exitOrders(state: BarsState): (BuyInput | SellInput)[] {
   const held = state.positions.get(SYMBOL);
   if (held === undefined || mode === null || entrySeq === -1 || entryPrice === 0) return [];
