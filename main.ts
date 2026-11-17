@@ -1,59 +1,63 @@
-// Sakura BTC Racer — 17 Nov edition — a long-only cbBTC bot for agent-fun/bars-replay/v1.
+// Sakura BTC Racer, 17 November race edition: a long-only trading bot
+// for cbBTC on the agent-fun/bars-replay/v1 protocol (one bar a minute).
 //
-// Design (built for a 6+ bps fee + slippage + impact round trip, so it trades
-// rarely and only on moves that dwarf the cost of trading):
+// A single round trip burns roughly 26 bps once fees, slippage and the
+// order's own price impact are added up, so this bot is deliberately
+// picky: it only spends cash on moves that are far larger than that cost.
 //
-//   Mode A — washout bounce (mean reversion after a panic flush):
-//     Arm when the close sits at least DEV (1.8%) below its EMA(120), RSI(14)
-//     is under 35 and the trailing 20-bar return is below -1.2%. While armed
-//     (90 bars) track the flush low; buy only once the close has bounced
-//     CONFIRM (0.5%) off that low on an up bar — never catch the falling
-//     knife itself. Exit on a 0.8% trailing stop from the peak close, a
-//     +4% take-profit, a -3% stop-loss, or after 720 bars.
+//   Mode A, the washout bounce: a panic flush arms the mode when the
+//     close trades at least 1.8% beneath its EMA(120) while RSI(14) sits
+//     at 35 or lower and the last 20 bars lost more than 1.2%. The mode
+//     then stays armed for 90 bars, tracking the lowest close of the
+//     flush, and buys only after price has climbed half a percent off
+//     that low on a rising bar, so it never grabs the falling knife.
+//     The position leaves on a 0.8% trailing stop below its best close,
+//     at +4% profit, at -3% loss, or after 720 bars at the latest.
 //
-//   Mode B — trend thrust (momentum ignition inside an uptrend):
-//     When the close is above EMA(120) and the trailing 10-bar return
-//     exceeds +1.2%, ride the thrust. Exit on a 0.6% trailing stop, a +4%
-//     take-profit, a -1.8% stop-loss, or after 240 bars.
+//   Mode B, the trend thrust: while the close holds above EMA(120), a
+//     ten-bar gain beyond +1.2% is treated as momentum ignition and the
+//     bot rides it. That position leaves on a tighter 0.6% trailing
+//     stop, at +4% profit, at -1.8% loss, or after 240 bars.
 //
-//   Risk overlay: 90% of cash per entry (impact-aware: a full-size round
-//   trip costs ~26 bps, and 90% keeps the impact leg near 13 bps a side),
-//   a per-mode cooldown after every exit, and a kill switch that stops new
-//   entries once equity falls 3.5% under the 1,000 USDC start — the dev
-//   gate only needs a profit, and the race ranks by net PnL, so capital
-//   preservation outranks activity. At most one position, long only.
+//   Risk comes first: each entry stakes 90% of the cash on hand, every
+//   exit starts a per-mode cooldown, and a kill switch blocks all new
+//   entries once equity slips 3.5% under the 1,000 USDC starting line.
+//   The dev gate only asks for any profit at all, and the live race is
+//   ranked purely by net PnL, so keeping capital intact beats trading
+//   often. One open position at a time, long only, never short.
 //
-// All indicators run in float64 on + - * / alone over the closes seen so
-// far, so two runs over the same bars send byte-identical orders. No
-// clock, no environment, no randomness is ever read. Race edition of
-// 17 November 2026, adapted from the 15 Nov Sakura BTC Racer.
+// Every indicator is float64 arithmetic (add, subtract, multiply,
+// divide) over the closes observed so far, which makes the bot fully
+// deterministic: the same bars always produce the same orders, byte
+// for byte. It reads no clock, no environment and no randomness.
+// Adapted for the 17 Nov 2026 race from the 15 Nov Sakura BTC Racer.
 
 import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 
-// --- shared parameters -------------------------------------------------
-const STAKE_FRACTION = 0.9; // share of cash spent on an entry
-const KILL_DRAWDOWN = 0.035; // stop opening positions below start * (1 - this)
-const BUY_SLIPPAGE_BPS = 200; // entries may chase a gap up to 2% past the close
-const SELL_SLIPPAGE_BPS = 300; // exits insist: up to 3% past the close
+// --- parameters shared by both modes -----------------------------------
+const STAKE_FRACTION = 0.9; // fraction of free cash staked per entry
+const KILL_DRAWDOWN = 0.035; // equity floor: start * (1 - this) blocks entries
+const BUY_SLIPPAGE_BPS = 200; // a buy may chase price 2% beyond the close
+const SELL_SLIPPAGE_BPS = 300; // a sell may concede 3% beyond the close
 
-// --- Mode A: washout bounce --------------------------------------------
-const A_DEV = 0.018; // close must be this far under EMA(120) to arm
-const A_RSI_MAX = 35; // ... with RSI(14) at or under this
-const A_DROP_BARS = 20; // trailing return window of the flush
-const A_DROP = -0.012; // ... which must be under -1.2%
-const A_ARM_BARS = 90; // an arming stays live this many bars
-const A_CONFIRM = 0.005; // buy once the close is +0.5% off the flush low
+// --- Mode A constants: the washout bounce -------------------------------
+const A_DEV = 0.018; // how far under EMA(120) the close must sit to arm
+const A_RSI_MAX = 35; // RSI(14) ceiling for arming, inclusive
+const A_DROP_BARS = 20; // lookback, in bars, of the flush's return
+const A_DROP = -0.012; // that return must be worse than -1.2%
+const A_ARM_BARS = 90; // bars an armed Mode A stays live
+const A_CONFIRM = 0.005; // required bounce off the flush low before buying
 const A_TAKE_PROFIT = 0.04;
 const A_STOP_LOSS = 0.03;
 const A_TRAIL = 0.008; // trailing stop under the peak close
 const A_MAX_HOLD = 720;
 const A_COOLDOWN = 30;
 
-// --- Mode B: trend thrust ----------------------------------------------
-const B_THRUST_BARS = 10; // trailing return window of the thrust
-const B_THRUST = 0.012; // ... which must exceed +1.2% above EMA(120)
+// --- Mode B constants: the trend thrust ---------------------------------
+const B_THRUST_BARS = 10; // lookback, in bars, of the thrust's return
+const B_THRUST = 0.012; // that return must beat +1.2% with price over EMA(120)
 const B_TAKE_PROFIT = 0.04;
 const B_STOP_LOSS = 0.018;
 const B_TRAIL = 0.006;
@@ -62,9 +66,9 @@ const B_COOLDOWN = 60;
 
 const EMA_SPAN = 120;
 const RSI_SPAN = 14;
-const WARMUP_BARS = 130; // indicators are trusted from this bar on (EMA/RSI settled)
+const WARMUP_BARS = 130; // first bar whose EMA/RSI values are trusted
 
-// --- indicator state -----------------------------------------------------
+// --- running indicator state (EMA(120) and RSI(14) over closes) ----------
 const closes: number[] = [];
 let ema120: number | null = null;
 let rsiAvgGain = 0;
@@ -99,18 +103,18 @@ function trailingReturn(bars: number): number | null {
   return now / then - 1;
 }
 
-// --- position state ------------------------------------------------------
+// --- open-position and signal state ---------------------------------------
 type Mode = 'A' | 'B';
-let mode: Mode | null = null;
-let entryPrice = 0; // the fill price of the open position (raw price units)
-let entrySeq = -1;
-let peakClose = 0;
-let armedUntil = -1;
-let flushLow = 0;
-let entrySentSeq = -1; // seq the in-flight entry order was decided on
-let cooldownAUntil = -1;
-let cooldownBUntil = -1;
-let startEquity: bigint | null = null;
+let mode: Mode | null = null; // which mode owns the pending or open trade
+let entryPrice = 0; // actual fill price of the open position, raw units
+let entrySeq = -1; // batch seq at which the entry filled
+let peakClose = 0; // highest close printed since the entry filled
+let armedUntil = -1; // last seq at which an armed Mode A may still trigger
+let flushLow = 0; // lowest close of the flush that armed Mode A
+let entrySentSeq = -1; // seq at which the in-flight entry order was decided
+let cooldownAUntil = -1; // Mode A may not signal again before this seq
+let cooldownBUntil = -1; // Mode B may not signal again before this seq
+let startEquity: bigint | null = null; // equity of the very first batch seen
 
 function noteFills(state: BarsState, batch: Batch): void {
   for (const fill of batch.fills) {
@@ -130,8 +134,8 @@ function noteFills(state: BarsState, batch: Batch): void {
 }
 
 function entryOrders(state: BarsState): (BuyInput | SellInput)[] {
-  if (startEquity === null) startEquity = state.equity;
-  if (state.equity * 1000n < startEquity * 965n) return [];
+  if (startEquity === null) startEquity = state.equity; // latch the starting equity once
+  if (state.equity * 1000n < startEquity * 965n) return []; // kill switch tripped: stay flat
   const close = closes[closes.length - 1];
   const seq = state.seq;
   if (seq >= cooldownAUntil && ema120 !== null && rsi !== null) {
@@ -171,8 +175,10 @@ function entryOrders(state: BarsState): (BuyInput | SellInput)[] {
   return [];
 }
 
-// Exits are evaluated only while a position is open: take-profit,
-// stop-loss, the trailing stop under the peak close, or the hold cap.
+// Exit logic, consulted only while a position is open. A position is
+// sold in full when any of these fires: the mode's take-profit level,
+// its stop-loss level, the trailing stop beneath the best close since
+// entry, or the mode's maximum holding time in bars.
 function exitOrders(state: BarsState): (BuyInput | SellInput)[] {
   const held = state.positions.get(SYMBOL);
   if (held === undefined || mode === null || entrySeq === -1 || entryPrice === 0) return [];
