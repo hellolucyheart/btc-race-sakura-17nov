@@ -121,8 +121,6 @@ function noteFills(state: BarsState, batch: Batch): void {
       peakClose = closes.length > 0 ? closes[closes.length - 1] : entryPrice;
     }
   }
-  // A position that vanished (exit filled, or the end flatten) resets the
-  // trade state; the cooldown was already set when the exit was sent.
   if (!state.positions.has(SYMBOL) && mode !== null && entrySeq !== -1) {
     mode = null;
     entrySeq = -1;
@@ -133,12 +131,9 @@ function noteFills(state: BarsState, batch: Batch): void {
 
 function entryOrders(state: BarsState): (BuyInput | SellInput)[] {
   if (startEquity === null) startEquity = state.equity;
-  // Kill switch: no new risk once equity is 3.5% under the start.
   if (state.equity * 1000n < startEquity * 965n) return [];
   const close = closes[closes.length - 1];
   const seq = state.seq;
-
-  // Mode A arming: a panic flush far under the trend average.
   if (seq >= cooldownAUntil && ema120 !== null && rsi !== null) {
     const drop = trailingReturn(A_DROP_BARS);
     if (drop !== null && close < ema120 * (1 - A_DEV) && rsi <= A_RSI_MAX && drop < A_DROP) {
@@ -160,8 +155,6 @@ function entryOrders(state: BarsState): (BuyInput | SellInput)[] {
       return [];
     }
   }
-
-  // Mode B: a thrust inside an uptrend.
   if (seq >= cooldownBUntil && ema120 !== null && close > ema120) {
     const thrust = trailingReturn(B_THRUST_BARS);
     if (thrust !== null && thrust > B_THRUST) {
@@ -212,10 +205,6 @@ await runBars({
     if (closes.length < WARMUP_BARS) return [];
     if (state.positions.has(SYMBOL)) return exitOrders(state);
     if (mode !== null) {
-      // An entry order is in flight and fills at the next open. If two
-      // batches pass with no position, the market rejected it (slippage
-      // cap or no bar): drop the pending mode so a fresh signal can fire
-      // instead of waiting on a fill that will never come.
       if (entrySentSeq !== -1 && state.seq > entrySentSeq + 1) {
         mode = null;
         entrySentSeq = -1;
